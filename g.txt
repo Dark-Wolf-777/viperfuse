@@ -1,0 +1,426 @@
+use std::{env, fs, path::Path};
+
+/* =============== Utils UTF-8 & positions =============== */
+
+fn strip_bom(mut s: String) -> String {
+    if s.starts_with('\u{feff}') { s = s.trim_start_matches('\u{feff}').to_string(); }
+    s
+}
+fn line_starts(s: &str) -> Vec<usize> {
+    let mut v = vec![0usize];
+    for (i, ch) in s.char_indices() {
+        if ch == '\n' && i + 1 < s.len() { v.push(i + 1); }
+    }
+    v
+}
+fn byte_to_line(offset: usize, starts: &[usize]) -> usize {
+    match starts.binary_search(&offset) { Ok(i) => i + 1, Err(i) => if i == 0 { 1 } else { i } }
+}
+fn line_slice<'a>(src: &'a str, starts: &[usize], line: usize) -> &'a str {
+    let li = line.saturating_sub(1);
+    if li >= starts.len() { return ""; }
+    let start = starts[li];
+    let end = if li + 1 < starts.len() { starts[li + 1].saturating_sub(1) } else { src.len() };
+    src[start..end].trim_end()
+}
+fn skip_ws(s: &str, i0: usize) -> usize {
+    let mut i = i0.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) { i += 1; }
+    for (di, ch) in s[i..].char_indices() {
+        if !ch.is_whitespace() { return i + di; }
+    }
+    s.len()
+}
+fn word_at(s: &str, i: usize, w: &str) -> bool {
+    if i > s.len() || !s[i..].starts_with(w) { return false; }
+    let is_id = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let prev = s[..i].chars().rev().next();
+    if prev.map_or(false, is_id) { return false; }
+    let next = s[i + w.len()..].chars().next();
+    if next.map_or(false, is_id) { return false; }
+    true
+}
+fn find_matching(s: &str, start: usize, open: char, close: char) -> Option<usize> {
+    if start > s.len() || !s.is_char_boundary(start) { return None; }
+    let mut d = 0i32;
+    for (di, ch) in s[start..].char_indices() {
+        let i = start + di;
+        if ch == open { d += 1; }
+        else if ch == close { d -= 1; if d == 0 { return Some(i); } }
+    }
+    None
+}
+fn ident_before(s: &str, pos: usize) -> Option<(String, usize)> {
+    if pos == 0 || pos > s.len() { return None; }
+    let mut k = s[..pos].char_indices().last()?.0;
+    loop {
+        if let Some((i, ch)) = s[..=k].char_indices().rev().find(|(_, c)| !c.is_whitespace()) {
+            k = i;
+            if ch == '>' {
+                let mut j = k; let mut depth = 0i32;
+                loop {
+                    let (ji, jch) = match s[..=j].char_indices().rev().next() { Some(x) => x, None => break };
+                    if jch == '>' { depth += 1; }
+                    else if jch == '<' {
+                        depth -= 1;
+                        if depth == 0 {
+                            k = if ji == 0 { 0 } else { s[..ji].char_indices().last().map(|(q, _)| q).unwrap_or(0) };
+                            break;
+                        }
+                    }
+                    if ji == 0 { break; }
+                    j = ji.saturating_sub(1);
+                }
+                continue;
+            }
+        } else { return None; }
+        break;
+    }
+    let is_id = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    if !is_id(s[k..].chars().next()?) { return None; }
+    let mut start = k;
+    while let Some((pi, ch)) = s[..start].char_indices().last() {
+        if is_id(ch) { start = pi; } else {
+            start = s[start..].char_indices().next().map(|(di, _)| start + di).unwrap_or(start);
+            break;
+        }
+    }
+    let end_excl = { let ch = s[k..].chars().next().unwrap(); k + ch.len_utf8() };
+    let name = &s[start..end_excl];
+    if name.chars().all(is_id) { Some((name.to_string(), start)) } else { None }
+}
+fn is_cs_primitive(t: &str) -> bool {
+    matches!(t, "bool"|"byte"|"sbyte"|"char"|"decimal"|"double"|"float"|"int"|"uint"|"long"|"ulong"|"short"|"ushort"|"string")
+}
+
+/* =============== Nettoyage commentaires/chaînes (préserve \n) =============== */
+
+fn strip_comments_and_strings(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let b = src.as_bytes(); let mut i = 0;
+    #[derive(Copy, Clone)] enum M { Code, Line, Block, Str, Verb, Chr }
+    let mut m = M::Code;
+    while i < b.len() {
+        match m {
+            M::Code => {
+                if i+1<b.len() && b[i]==b'/' && b[i+1]==b'/' { m=M::Line; out.push(' '); i+=2; }
+                else if i+1<b.len() && b[i]==b'/' && b[i+1]==b'*' { m=M::Block; out.push(' '); i+=2; }
+                else if b[i]==b'@' && i+1<b.len() && b[i+1]==b'"' { m=M::Verb; out.push(' '); i+=2; }
+                else if b[i]==b'"' { m=M::Str; out.push(' '); i+=1; }
+                else if b[i]==b'\'' { m=M::Chr; out.push(' '); i+=1; }
+                else { out.push(b[i] as char); i+=1; }
+            }
+            M::Line  => { if b[i]==b'\n' { m=M::Code; out.push('\n'); } else { if b[i]==b'\r'{out.push('\r')} else {out.push(' ')} } i+=1; }
+            M::Block => { if i+1<b.len() && b[i]==b'*' && b[i+1]==b'/' { out.push(' '); i+=2; m=M::Code; }
+                          else { if b[i]==b'\n'{out.push('\n')} else if b[i]==b'\r'{out.push('\r')} else {out.push(' ')} i+=1; } }
+            M::Str   => { if b[i]==b'\\' && i+1<b.len() { out.push(' '); i+=2; }
+                          else if b[i]==b'"' { out.push(' '); i+=1; m=M::Code; }
+                          else { if b[i]==b'\n'{out.push('\n')} else if b[i]==b'\r'{out.push('\r')} else {out.push(' ')} i+=1; } }
+            M::Verb  => { if b[i]==b'"' { if i+1<b.len() && b[i+1]==b'"' { out.push(' '); i+=2; } else { out.push(' '); i+=1; m=M::Code; } }
+                          else { if b[i]==b'\n'{out.push('\n')} else if b[i]==b'\r'{out.push('\r')} else {out.push(' ')} i+=1; } }
+            M::Chr   => { if b[i]==b'\\' && i+1<b.len() { out.push(' '); i+=2; }
+                          else if b[i]==b'\'' { out.push(' '); i+=1; m=M::Code; }
+                          else { if b[i]==b'\n'{out.push('\n')} else if b[i]==b'\r'{out.push('\r')} else {out.push(' ')} i+=1; } }
+        }
+    }
+    out
+}
+
+/* =============== Helpers variables =============== */
+
+fn split_top_level_commas(s: &str) -> Vec<(usize, usize)> {
+    let mut v = Vec::new(); let mut start = 0usize;
+    let (mut par, mut br, mut brk) = (0i32, 0i32, 0i32);
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => par += 1, ')' => par -= 1,
+            '{' => br += 1,  '}' => br -= 1,
+            '[' => brk += 1, ']' => brk -= 1,
+            ',' if par == 0 && br == 0 && brk == 0 => { v.push((start, i)); start = i + 1; }
+            _ => {}
+        }
+    }
+    v.push((start, s.len()));
+    v
+}
+fn strip_modifiers<'a>(tokens: &'a [&'a str]) -> (&'a [&'a str], usize) {
+    let mut i = 0;
+    let mods = ["public","private","protected","internal","static","readonly","const","volatile","ref","out","in","unsafe","new","sealed","virtual","override","async","partial"];
+    while i < tokens.len() && mods.contains(&tokens[i]) { i += 1; }
+    (&tokens[i..], i)
+}
+fn looks_like_method_stmt(stmt_clean: &str) -> bool {
+    let first_eq = stmt_clean.find('=').unwrap_or(usize::MAX);
+    let first_comma = stmt_clean.find(',').unwrap_or(usize::MAX);
+    let first_sc = stmt_clean.find(';').unwrap_or(usize::MAX);
+    let lim = first_eq.min(first_comma).min(first_sc);
+    stmt_clean[..lim.min(stmt_clean.len())].contains('(')
+}
+
+/* =============== Détection classes / fonctions (lignes complètes) =============== */
+
+fn parse_classes_lines(clean: &str, clean_lines: &[usize]) -> Vec<usize> {
+    let mut v = Vec::new();
+    for (i, _) in clean.char_indices() {
+        if word_at(clean, i, "class") { v.push(byte_to_line(i, clean_lines)); }
+    }
+    v.sort(); v.dedup(); v
+}
+fn looks_like_method_def(s: &str, close_paren: usize) -> bool {
+    let k = skip_ws(s, close_paren + 1);
+    if k >= s.len() { return false; }
+    if s[k..].starts_with("=>") || s[k..].starts_with('{') { return true; }
+    if s[k..].starts_with("where") {
+        let mut i = k + "where".len();
+        loop {
+            if i >= s.len() { break; }
+            let j = skip_ws(s, i);
+            if s[j..].starts_with('{') || s[j..].starts_with("=>") { return true; }
+            if let Some((di, _)) = s[i..].char_indices().next() { i = i + di + 1; } else { break; }
+        }
+    }
+    false
+}
+fn parse_functions_lines(clean: &str, clean_lines: &[usize]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (i, ch) in clean.char_indices() {
+        if ch == '(' {
+            if let Some(pe) = find_matching(clean, i, '(', ')') {
+                if let Some((name, ns)) = ident_before(clean, i) {
+                    let bad = ["if","for","foreach","while","switch","catch","nameof","using","lock","checked","unchecked","fixed","when","new","base","this","typeof","default"];
+                    if bad.iter().any(|&k| k == name) { continue; }
+                    if looks_like_method_def(clean, pe) { out.push(byte_to_line(ns, clean_lines)); }
+                }
+            }
+        }
+    }
+    out.sort(); out.dedup(); out
+}
+
+/* =============== Variables (par ligne, ignore commentaires) =============== */
+
+#[derive(Clone)]
+struct VarHit { text: String, line: usize }
+
+fn parse_variables_by_line(src: &str, clean: &str) -> (Vec<VarHit>, Vec<VarHit>) {
+    let mut simple = Vec::new(); let mut object = Vec::new();
+    let skip_heads = ["using","return","class","interface","enum","struct","namespace","case","default","if","for","foreach","while","switch","lock"];
+
+    for (ln0, (line_src, line_clean)) in src.lines().zip(clean.lines()).enumerate() {
+        let ln = ln0 + 1;
+        let s = line_clean.trim();
+        if s.is_empty() { continue; }
+        if skip_heads.iter().any(|k| s.starts_with(k)) { continue; }
+        if looks_like_method_stmt(s) { continue; }
+
+        let toks: Vec<&str> = s.split_whitespace().collect();
+        if toks.len() < 2 { continue; }
+        let (toks, _) = strip_modifiers(&toks);
+        if toks.len() < 2 { continue; }
+        let dtype = toks[0];
+        if ["class","interface","enum","struct","namespace"].contains(&dtype) { continue; }
+
+        // après le type, au moins un ident (séparé par virgules niveau 0)
+        let rest_pos = s.find(dtype).map(|p| p + dtype.len()).unwrap_or(0);
+        let decl = s[rest_pos..].trim();
+        if decl.is_empty() { continue; }
+
+        let mut any = false;
+        for (ds, de) in split_top_level_commas(decl) {
+            let seg = decl[ds..de].trim();
+            if seg.is_empty() { continue; }
+            let first = seg.chars().skip_while(|c| c.is_whitespace()).next().unwrap_or('\0');
+            if !(first == '@' || first.is_ascii_alphabetic() || first == '_') { continue; }
+            any = true;
+        }
+        if !any { continue; }
+
+        // classif simple/objet (heuristique via la ligne clean)
+        let kind = if dtype == "var" {
+            let has_paren = s.contains('(') || s.contains('{') || s.contains('[');
+            let is_bool = s.contains(" true") || s.contains(" false");
+            let is_num  = s.chars().any(|c| c.is_ascii_digit());
+            if is_bool || (is_num && !has_paren) { "simple" } else { "objet" }
+        } else {
+            let base = dtype.split('<').next().unwrap_or(dtype).trim_end_matches("[]").trim();
+            if is_cs_primitive(base) { "simple" } else { "objet" }
+        };
+
+        let hit = VarHit { text: line_src.trim_end().to_string(), line: ln };
+        if kind == "simple" { simple.push(hit); } else { object.push(hit); }
+    }
+
+    simple.sort_by_key(|v| (v.line, v.text.clone()));
+    object.sort_by_key(|v| (v.line, v.text.clone()));
+    simple.dedup_by(|a,b| a.line==b.line && a.text==b.text);
+    object.dedup_by(|a,b| a.line==b.line && a.text==b.text);
+    (simple, object)
+}
+
+/* =============== Conditions (affiche seulement if / else if / else sur la ligne) =============== */
+
+#[derive(Debug)]
+struct Cond { kind: &'static str, line: usize, block_start: usize, block_end: usize }
+
+fn parse_conditions(clean: &str, clean_lines: &[usize]) -> Vec<Cond> {
+    let mut out = Vec::new();
+    for (i, _) in clean.char_indices() {
+        if word_at(clean, i, "if") {
+            let j = skip_ws(clean, i + "if".len());
+            if clean[j..].starts_with('(') {
+                if let Some(pe) = find_matching(clean, j, '(', ')') {
+                    let k = skip_ws(clean, pe + 1);
+                    let (bs, be) = if clean[k..].starts_with('{') {
+                        if let Some(br) = find_matching(clean, k, '{', '}') {
+                            (byte_to_line(k, clean_lines), byte_to_line(br, clean_lines))
+                        } else { (byte_to_line(k, clean_lines), byte_to_line(k, clean_lines)) }
+                    } else {
+                        let mut end = k;
+                        for (di, ch) in clean[k..].char_indices() { if ch == ';' { end = k + di; break; } }
+                        (byte_to_line(k, clean_lines), byte_to_line(end, clean_lines))
+                    };
+                    out.push(Cond { kind: "if", line: byte_to_line(i, clean_lines), block_start: bs, block_end: be });
+                }
+            }
+        } else if word_at(clean, i, "else") {
+            let j = skip_ws(clean, i + "else".len());
+            if clean[j..].starts_with("if") {
+                let j2 = skip_ws(clean, j + "if".len());
+                if clean[j2..].starts_with('(') {
+                    if let Some(pe) = find_matching(clean, j2, '(', ')') {
+                        let k = skip_ws(clean, pe + 1);
+                        let (bs, be) = if clean[k..].starts_with('{') {
+                            if let Some(br) = find_matching(clean, k, '{', '}') {
+                                (byte_to_line(k, clean_lines), byte_to_line(br, clean_lines))
+                            } else { (byte_to_line(k, clean_lines), byte_to_line(k, clean_lines)) }
+                        } else {
+                            let mut end = k;
+                            for (di, ch) in clean[k..].char_indices() { if ch == ';' { end = k + di; break; } }
+                            (byte_to_line(k, clean_lines), byte_to_line(end, clean_lines))
+                        };
+                        out.push(Cond { kind: "elif", line: byte_to_line(i, clean_lines), block_start: bs, block_end: be });
+                    }
+                }
+            } else {
+                let (bs, be) = if clean[j..].starts_with('{') {
+                    if let Some(br) = find_matching(clean, j, '{', '}') {
+                        (byte_to_line(j, clean_lines), byte_to_line(br, clean_lines))
+                    } else { (byte_to_line(j, clean_lines), byte_to_line(j, clean_lines)) }
+                } else {
+                    let mut end = j;
+                    for (di, ch) in clean[j..].char_indices() { if ch == ';' { end = j + di; break; } }
+                    (byte_to_line(j, clean_lines), byte_to_line(end, clean_lines))
+                };
+                out.push(Cond { kind: "else", line: byte_to_line(i, clean_lines), block_start: bs, block_end: be });
+            }
+        }
+    }
+    out
+}
+
+/// Sous-chaîne de la ligne source à partir de if / else if / else.
+fn cut_condition_line<'a>(line_src: &'a str, kind: &str) -> Option<&'a str> {
+    let needle = match kind { "if" => "if", "elif" => "else", _ => "else" };
+    let is_id = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut prev: Option<char> = None;
+    for (bi, ch) in line_src.char_indices() {
+        if line_src[bi..].starts_with(needle) {
+            let after = bi + needle.len();
+            let prev_ok = !prev.map_or(false, is_id);
+            let next_ok = !line_src[after..].chars().next().map_or(false, is_id);
+            if prev_ok && next_ok {
+                let trimmed = line_src[bi..].trim_start();
+                if trimmed.is_empty() || trimmed == "}" || trimmed == "{"
+                    || trimmed.starts_with('}') || trimmed.starts_with('{') {
+                    return None;
+                }
+                if !(trimmed.starts_with("if") || trimmed.starts_with("else")) { return None; }
+                return Some(trimmed);
+            }
+        }
+        prev = Some(ch);
+    }
+    None
+}
+
+/* =============== I/O & main =============== */
+
+fn usage(p: &str) { eprintln!("Usage: {} -i <fichier.cs>", p); }
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let prog = args.get(0).map(|s| s.as_str()).unwrap_or("cs_analyzer");
+    let mut input: Option<String> = None; let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-i" | "--input" => {
+                if i + 1 >= args.len() { usage(prog); return; }
+                input = Some(args[i + 1].clone()); i += 2;
+            }
+            _ => { i += 1; }
+        }
+    }
+    let Some(path) = input else { usage(prog); return; };
+    if !Path::new(&path).exists() { eprintln!("Fichier introuvable: {}", path); std::process::exit(1); }
+
+    let src = strip_bom(fs::read_to_string(&path).expect("Impossible de lire le fichier"));
+    let clean = strip_comments_and_strings(&src);
+
+    let lidx_src   = line_starts(&src);
+    let lidx_clean = line_starts(&clean);
+
+    let class_lines = parse_classes_lines(&clean, &lidx_clean);
+    let func_lines  = parse_functions_lines(&clean, &lidx_clean);
+    let (vars_s, vars_o) = parse_variables_by_line(&src, &clean);
+    let conds       = parse_conditions(&clean, &lidx_clean);
+
+    // Alignement pro des libellés variables (colonne fixe pour le label)
+    const LABEL_COL: usize = 20;
+    let lbl_simple = "[Variable simple]";
+    let lbl_obj    = "[Variable objet]";
+
+    // largeur pour aligner les numéros de ligne (optionnel, esthétique)
+    let max_line = vars_s.iter().chain(vars_o.iter()).map(|v| v.line).max().unwrap_or(0);
+    let line_w = if max_line == 0 { 1 } else { max_line.to_string().len() };
+
+    println!("--------------class-----------");
+    if class_lines.is_empty() { println!("(aucune classe trouvée)"); } else {
+        for line in class_lines {
+            println!("[Class] : {} (ligne {})", line_slice(&src, &lidx_src, line), line);
+        }
+    }
+
+    println!("\n-----------Function----------");
+    if func_lines.is_empty() { println!("(aucune fonction/méthode trouvée)"); } else {
+        for line in func_lines {
+            println!("[Function]: {} (ligne {})", line_slice(&src, &lidx_src, line), line);
+        }
+    }
+
+    println!("\n-----------Variable-----------");
+    if vars_s.is_empty() && vars_o.is_empty() { println!("(aucune variable trouvée)"); } else {
+        for v in vars_s {
+            // ➜ contenu sans indentation initiale pour aligner toutes les lignes
+            let content = v.text.trim_start();
+            println!("{:<width$}: {} (ligne {:>lnw$})", lbl_simple, content, v.line, width=LABEL_COL, lnw=line_w);
+        }
+        for v in vars_o {
+            let content = v.text.trim_start();
+            println!("{:<width$}: {} (ligne {:>lnw$})", lbl_obj, content, v.line, width=LABEL_COL, lnw=line_w);
+        }
+    }
+
+    println!("\n------------Condition----------------");
+    if conds.is_empty() { println!("(aucune condition trouvée)"); } else {
+        for c in conds {
+            let raw = line_slice(&src, &lidx_src, c.line);
+            if let Some(shown) = cut_condition_line(raw, c.kind) {
+                match c.kind {
+                    "if"   => println!("[if]   : {}\n           (ligne {}, bloc: {}-{})", shown, c.line, c.block_start, c.block_end),
+                    "elif" => println!("[elif] : {}\n           (ligne {}, bloc: {}-{})", shown, c.line, c.block_start, c.block_end),
+                    _      => println!("[else] : {}\n           (ligne {}, bloc: {}-{})", shown, c.line, c.block_start, c.block_end),
+                }
+            }
+        }
+    }
+}
